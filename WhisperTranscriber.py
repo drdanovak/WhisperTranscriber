@@ -1,10 +1,8 @@
 # app.py
-# Whisper-based transcription with simple, dependency-light speaker labeling.
+# Whisper-based transcription with simple speaker labeling using torchaudio MFCCs.
 # Designed to run reliably on Streamlit Cloud (Python 3.13, CPU).
 
 import os
-import io
-import json
 import tempfile
 import subprocess
 import datetime
@@ -24,14 +22,16 @@ import whisper
 import soundfile as sf
 import imageio_ffmpeg
 
-# Lightweight acoustic features for clustering
-import librosa
+# Torchaudio for MFCCs & deltas (lightweight, no numba)
+import torchaudio
+import torchaudio.functional as AF
+import torchaudio.transforms as AT
 
 
 # ------------------------------ UI --------------------------------
 st.set_page_config(page_title="Whisper Diarized Transcriber", layout="centered")
 st.title("Whisper Diarized Transcriber")
-st.caption("Upload audio/video → transcribe with Whisper → cluster speakers (MFCCs) → download a timestamped .txt file.")
+st.caption("Upload audio/video → convert with ffmpeg → transcribe with Whisper → cluster speakers (MFCCs) → download timestamped .txt.")
 
 with st.sidebar:
     st.header("Settings")
@@ -56,7 +56,7 @@ with st.sidebar:
     auto_speakers = st.checkbox(
         "Auto-detect number of speakers",
         value=True,
-        help="Tries 1–6 and picks the best clustering. Uncheck to set manually."
+        help="Tries 1–6 and picks the best clustering."
     )
     max_auto = st.slider("Auto-detect: max speakers to try", 2, 8, 6, disabled=not auto_speakers)
     num_speakers = st.number_input(
@@ -120,21 +120,30 @@ def transcribe_whisper(model, wav_path: str, device: str, language_code: Optiona
 def segment_mfcc_embeddings(
     wav_path: str,
     segments: List[Dict[str, Any]],
-    n_mfcc: int = 20,
     sr_expected: int = 16000,
+    n_mfcc: int = 20,
 ) -> np.ndarray:
     """
-    Compute a simple MFCC-based embedding per Whisper segment.
-    We average MFCCs (and deltas) over time to get a compact vector.
+    Compute MFCC embeddings per Whisper segment with torchaudio.
+    For each segment, compute MFCCs + deltas (+ delta-deltas), then mean/std over time.
     """
-    # Load the 16k mono we created (guaranteed by to_wav_mono16k)
+    # Load waveform (guaranteed mono 16k from our ffmpeg step)
     wav, sr = sf.read(wav_path, dtype="float32", always_2d=False)
     if wav.ndim > 1:
         wav = wav.mean(axis=1)
     if sr != sr_expected:
-        # Safety: resample with librosa if somehow not 16k
-        wav = librosa.resample(wav, orig_sr=sr, target_sr=sr_expected)
+        # Fallback resample with torchaudio if needed (rare).
+        wav_t, _ = torchaudio.load(wav_path)
+        wav_t = torchaudio.functional.resample(wav_t, sr, sr_expected)
+        wav = wav_t.squeeze(0).numpy()
         sr = sr_expected
+
+    # Prepare transforms (on CPU)
+    mfcc_tf = AT.MFCC(
+        sample_rate=sr,
+        n_mfcc=n_mfcc,
+        melkwargs={"n_fft": 400, "win_length": 400, "hop_length": 160, "n_mels": 40}
+    )
 
     feats = []
     for seg in segments:
@@ -143,27 +152,28 @@ def segment_mfcc_embeddings(
         s_idx = int(round(start * sr))
         e_idx = min(len(wav), int(round(end * sr)))
         if e_idx <= s_idx:
-            # guard tiny/zero-length segments
-            e_idx = min(len(wav), s_idx + int(0.2 * sr))
-        clip = wav[s_idx:e_idx]
-        if len(clip) < int(0.1 * sr):  # very short: pad a bit
-            pad = int(0.1 * sr) - len(clip)
-            clip = np.pad(clip, (0, max(0, pad)))
+            e_idx = min(len(wav), s_idx + int(0.2 * sr))  # pad tiny segments
+        clip = torch.from_numpy(wav[s_idx:e_idx]).float().unsqueeze(0)  # (1, T)
 
-        # MFCCs
-        mfcc = librosa.feature.mfcc(y=clip, sr=sr, n_mfcc=n_mfcc)  # (n_mfcc, T)
-        delta = librosa.feature.delta(mfcc)
-        delta2 = librosa.feature.delta(mfcc, order=2)
+        # MFCC shape: (1, n_mfcc, time)
+        with torch.no_grad():
+            mfcc = mfcc_tf(clip)
 
-        # Aggregate over time (mean + std)
-        v = np.concatenate([
-            mfcc.mean(axis=1), mfcc.std(axis=1),
-            delta.mean(axis=1), delta.std(axis=1),
-            delta2.mean(axis=1), delta2.std(axis=1),
-        ]).astype(np.float32)
-        feats.append(v)
+            # deltas
+            delta = AF.compute_deltas(mfcc)
+            delta2 = AF.compute_deltas(delta)
 
-    embs = np.vstack(feats)
+            # aggregate over time: mean + std for each set
+            def agg(x: torch.Tensor) -> torch.Tensor:
+                # x: (1, C, T)
+                m = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0).mean(dim=-1)
+                s = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0).std(dim=-1, unbiased=False)
+                return torch.cat([m, s], dim=1)  # (1, 2*C)
+
+            v = torch.cat([agg(mfcc), agg(delta), agg(delta2)], dim=1)  # (1, 6*n_mfcc)
+            feats.append(v.squeeze(0).cpu().numpy())
+
+    embs = np.vstack(feats).astype(np.float32)
     # Replace NaNs/Infs if any numerical issues
     embs = np.nan_to_num(embs, nan=0.0, posinf=0.0, neginf=0.0)
     return embs
@@ -171,13 +181,13 @@ def segment_mfcc_embeddings(
 def pick_num_speakers(embs: np.ndarray, max_k: int) -> int:
     """
     Choose K in [1..max_k] by maximizing silhouette score (if K>1).
-    If all poor, fall back to 1.
+    Fall back to 1 if not enough samples or degenerate clustering.
     """
     n = embs.shape[0]
     if n < 3:
         return 1
     best_k, best_score = 1, -1.0
-    upper = max(2, min(max_k, n))  # can’t exceed number of samples
+    upper = max(2, min(max_k, n))
     for k in range(2, upper + 1):
         labels = AgglomerativeClustering(k).fit_predict(embs)
         if len(set(labels)) < 2 or len(set(labels)) >= len(labels):
@@ -194,14 +204,6 @@ def apply_speaker_labels(segments: List[Dict[str, Any]], labels: np.ndarray):
     for i, seg in enumerate(segments):
         seg["speaker"] = f"SPEAKER {int(labels[i]) + 1}"
     return segments
-
-def srt_time(s: float) -> str:
-    ms_total = int(round(s * 1000))
-    ms = ms_total % 1000
-    sec = (ms_total // 1000) % 60
-    minute = (ms_total // 60000) % 60
-    hour = ms_total // 3600000
-    return f"{hour:02d}:{minute:02d}:{sec:02d},{ms:03d}"
 
 def to_txt(segments: List[Dict[str, Any]], show_ts: bool) -> str:
     def hhmmss(s: float) -> str:
@@ -263,23 +265,10 @@ if uploaded and st.button("Transcribe"):
                         apply_speaker_labels(segments, labels)
                         labels_used = True
                 except Exception as e:
-                    st.warning(
-                        "Speaker labeling failed; continuing with plain transcript.\n\n"
-                        f"Details: {e}"
-                    )
+                    st.warning("Speaker labeling failed; continuing with plain transcript.\n\n"
+                               f"Details: {e}")
 
             # 4) Render + download
             txt = to_txt(segments, show_timestamps)
             st.subheader("Transcript")
-            st.write(txt if txt else "(empty)")
-
-            fname = timestamped_filename(uploaded.name, "txt")
-            st.download_button("Download transcript (.txt)", data=txt.encode("utf-8"), file_name=fname)
-
-            if labels_used:
-                st.success("Done! Transcription + speaker labels ready.")
-            else:
-                st.success("Done! Transcription ready.")
-
-    except Exception as e:
-        st.error(f"Unexpected error: {e}")
+            st.write(txt
