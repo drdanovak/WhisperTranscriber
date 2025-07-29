@@ -1,21 +1,19 @@
---index-url https://pypi.org/simple
---extra-index-url https://download.pytorch.org/whl/cpu
+# Core app
+streamlit
 
-# Whisper (Py3.13 friendly)
-openai-whisper==20250625
+# Whisper + runtime
+openai-whisper
 
-# PyTorch CPU-only wheels for reliability on Streamlit Cloud
-torch==2.7.1+cpu
-torchaudio==2.7.1+cpu
+# CPU PyTorch stack (wheels available on PyPI for py3.13)
+torch>=2.6
+torchaudio>=2.6
 
-# Scientific stack (no numba/llvmlite now)
-numpy==2.3.2
-scipy==1.16.1
-scikit-learn==1.7.1
-soundfile==0.13.1
+# Audio & features
+librosa>=0.10.2
+soundfile>=0.13.1
+imageio-ffmpeg>=0.4.9
 
-# Streamlit app
-streamlit==1.47.1
-
-# Bundled ffmpeg (no system packages needed)
-imageio-ffmpeg==0.6.0
+# Diarization (clustering)
+scikit-learn>=1.4
+numpy>=1.26
+scipy>=1.11
