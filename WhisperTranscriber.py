@@ -1,274 +1,263 @@
-# app.py
-# Whisper-based transcription with simple speaker labeling using torchaudio MFCCs.
-# Designed to run reliably on Streamlit Cloud (Python 3.13, CPU).
-
 import os
+import io
+import math
 import tempfile
-import subprocess
-import datetime
-from typing import List, Dict, Any, Optional
-
-import numpy as np
-from sklearn.cluster import AgglomerativeClustering
-from sklearn.metrics import silhouette_score
+from datetime import timedelta
+from typing import List, Tuple, Optional
 
 import streamlit as st
 
-# ASR
-import torch
-import whisper
-
-# Audio I/O / conversion
-import soundfile as sf
+# ---- Ensure ffmpeg is available (bundled) ----
+# We rely on imageio-ffmpeg's statically linked ffmpeg so we don't need system packages.
 import imageio_ffmpeg
+ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+os.environ["PATH"] = os.path.dirname(ffmpeg_path) + os.pathsep + os.environ.get("PATH", "")
 
-# Torchaudio for MFCCs & deltas (lightweight, no numba)
-import torchaudio
-import torchaudio.functional as AF
-import torchaudio.transforms as AT
+# ---- Whisper and audio utils ----
+import whisper
+from whisper.utils import format_timestamp
 
+# Lightweight feature extraction for diarization
+import numpy as np
+import librosa
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.metrics import silhouette_score
 
-# ------------------------------ UI --------------------------------
+# Optional: torchaudio can help ensure the CPU-only stack is available,
+# but we don't import it unless needed to avoid extra overhead.
+
+# ---------- UI ----------
 st.set_page_config(page_title="Whisper Diarized Transcriber", layout="centered")
-st.title("Whisper Diarized Transcriber")
-st.caption("Upload audio/video → convert with ffmpeg → transcribe with Whisper → cluster speakers (MFCCs) → download timestamped .txt.")
+st.title("🎙️ Whisper Diarized Transcriber")
 
-with st.sidebar:
-    st.header("Settings")
+st.markdown(
+    """
+Upload **any common audio/video** file.  
+The app will:
+1) Convert your media to audio (via a bundled `ffmpeg`)  
+2) Transcribe with OpenAI Whisper (local, CPU by default)  
+3) **Diarize** by clustering per‑segment audio features (MFCC statistics)  
+4) Let you **download** a timestamped plain-text transcript with **speaker labels**  
+    """
+)
+
+with st.expander("⚙️ Settings"):
     model_size = st.selectbox(
         "Whisper model",
-        ["small", "medium", "large"],
-        index=0,
-        help="Larger models are more accurate but slower."
-    )
-    language_mode = st.selectbox(
-        "Language",
-        ["Auto-detect", "English", "Specify code…"],
+        ["base", "small", "medium"],  # keep sizes modest for Streamlit CPU
         index=1,
-        help="Use 'Auto-detect' or specify a language code (e.g., en, es, fr)."
+        help="Larger models are more accurate but slower. 'small' is a good default."
     )
-    language_code: Optional[str] = None
-    if language_mode == "English":
-        language_code = "en"
-    elif language_mode == "Specify code…":
-        language_code = st.text_input("Language code (BCP-47)", value="en").strip() or None
-
-    auto_speakers = st.checkbox(
-        "Auto-detect number of speakers",
-        value=True,
-        help="Tries 1–6 and picks the best clustering."
+    language_hint = st.text_input(
+        "Language hint (optional)",
+        value="",
+        help="e.g., 'en' or 'English'. Leave blank to auto-detect."
     )
-    max_auto = st.slider("Auto-detect: max speakers to try", 2, 8, 6, disabled=not auto_speakers)
-    num_speakers = st.number_input(
-        "Speakers (manual)", min_value=1, max_value=20, value=2, step=1, disabled=auto_speakers
+    enable_translate = st.checkbox(
+        "Translate to English (if supported by model)", value=False
     )
-
-    show_timestamps = st.checkbox("Show timestamps in TXT", value=True)
+    max_speakers = st.slider(
+        "Max speakers to try (auto-estimate within 1..N)",
+        min_value=1, max_value=6, value=3,
+        help="The app will try 1..N speakers and pick the best clustering by silhouette score."
+    )
+    min_segment_sec = st.slider(
+        "Merge very short segments (seconds, 0 = off)", 0.0, 2.0, 0.5, 0.1,
+        help="Post-process to merge very short turns with neighbors, reducing spurious switches."
+    )
 
 uploaded = st.file_uploader(
-    "Upload audio or video",
+    "Upload audio/video",
     type=[
-        "wav", "mp3", "m4a", "mp4", "mov", "aac", "flac", "ogg", "webm",
-        "wma", "mkv", "avi", "m4v", "3gp"
+        "mp3","mp4","mpeg","mpga","m4a","wav","webm","flac","ogg","opus","mkv","mov","avi"
     ],
-    accept_multiple_files=False
 )
-if uploaded:
-    try:
-        st.audio(uploaded)
-    except Exception:
-        pass
 
+def _safe_filename(name: str) -> str:
+    keep = "-_.() "
+    return "".join(c for c in name if c.isalnum() or c in keep).strip().replace(" ", "_")
 
-# --------------------------- Helpers & Cache -----------------------
 @st.cache_resource(show_spinner=False)
-def load_whisper(model_size: str):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = whisper.load_model(model_size, device=device)
-    return model, device
+def load_whisper(model_name: str):
+    # Whisper will download model weights on first run and cache them
+    return whisper.load_model(model_name)
 
-def ffmpeg_bin() -> str:
-    return imageio_ffmpeg.get_ffmpeg_exe()
+def _to_tmp_file(uploaded_file) -> str:
+    suffix = os.path.splitext(uploaded_file.name)[1].lower()
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp.write(uploaded_file.read())
+    tmp.flush()
+    tmp.close()
+    return tmp.name
 
-def to_wav_mono16k(tmpdir: str, infile_path: str) -> str:
+def _media_to_wav(input_path: str, sr: int = 16000) -> str:
     """
-    Convert any media to 16kHz mono WAV using a bundled ffmpeg binary.
+    Converts any media to mono WAV 16k using bundled ffmpeg for consistent processing.
     """
-    wav_path = os.path.join(tmpdir, "audio_16k_mono.wav")
-    cmd = [
-        ffmpeg_bin(), "-y",
-        "-i", infile_path,
-        "-ac", "1",     # mono
-        "-ar", "16000", # 16 kHz
-        wav_path
-    ]
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if proc.returncode != 0 or not os.path.exists(wav_path):
-        err = proc.stderr.decode("utf-8", errors="ignore")
-        raise RuntimeError(f"ffmpeg conversion failed:\n{err[:2000]}")
-    return wav_path
+    out_path = tempfile.mktemp(suffix=".wav")
+    # -ac 1 mono, -ar 16000 sample rate
+    cmd = f'"{ffmpeg_path}" -y -i "{input_path}" -ac 1 -ar {sr} "{out_path}"'
+    code = os.system(cmd)
+    if code != 0 or not os.path.exists(out_path):
+        raise RuntimeError("ffmpeg failed to convert media to WAV.")
+    return out_path
 
-def transcribe_whisper(model, wav_path: str, device: str, language_code: Optional[str]):
-    kwargs = {
-        "language": language_code,
-        "verbose": False,
-    }
-    if device == "cpu":
-        kwargs["fp16"] = False
-    return model.transcribe(wav_path, **kwargs)
+def _merge_short_segments(segments, threshold_sec: float):
+    if threshold_sec <= 0 or len(segments) <= 1:
+        return segments
+    merged = []
+    cur = segments[0].copy()
+    for nxt in segments[1:]:
+        if (cur["end"] - cur["start"]) < threshold_sec:
+            # merge into next
+            cur["end"] = nxt["start"]
+            cur["text"] = (cur.get("text","") + " " + nxt.get("text","")).strip()
+            nxt["start"] = cur["start"]
+            cur = nxt
+        else:
+            merged.append(cur)
+            cur = nxt
+    merged.append(cur)
+    return merged
 
-def segment_mfcc_embeddings(
-    wav_path: str,
-    segments: List[Dict[str, Any]],
-    sr_expected: int = 16000,
-    n_mfcc: int = 20,
-) -> np.ndarray:
+def _mfcc_stats(y: np.ndarray, sr: int, start: float, end: float, n_mfcc=20) -> np.ndarray:
     """
-    Compute MFCC embeddings per Whisper segment with torchaudio.
-    For each segment, compute MFCCs + deltas (+ delta-deltas), then mean/std over time.
+    Extract MFCCs over [start,end] seconds and return mean+std as a compact embedding.
     """
-    # Load waveform (guaranteed mono 16k from our ffmpeg step)
-    wav, sr = sf.read(wav_path, dtype="float32", always_2d=False)
-    if wav.ndim > 1:
-        wav = wav.mean(axis=1)
-    if sr != sr_expected:
-        # Fallback resample with torchaudio if needed (rare).
-        wav_t, _ = torchaudio.load(wav_path)
-        wav_t = torchaudio.functional.resample(wav_t, sr, sr_expected)
-        wav = wav_t.squeeze(0).numpy()
-        sr = sr_expected
+    start_samp = max(0, int(start * sr))
+    end_samp = min(len(y), int(end * sr))
+    if end_samp <= start_samp:
+        end_samp = min(len(y), start_samp + int(0.1*sr))  # ensure tiny window
+    clip = y[start_samp:end_samp]
+    if clip.size == 0:
+        clip = y[max(0, start_samp - int(0.1*sr)):min(len(y), start_samp + int(0.1*sr))]
+    mfcc = librosa.feature.mfcc(y=clip.astype(np.float32), sr=sr, n_mfcc=n_mfcc)
+    mu = mfcc.mean(axis=1)
+    sd = mfcc.std(axis=1)
+    return np.concatenate([mu, sd])
 
-    # Prepare transforms (on CPU)
-    mfcc_tf = AT.MFCC(
-        sample_rate=sr,
-        n_mfcc=n_mfcc,
-        melkwargs={"n_fft": 400, "win_length": 400, "hop_length": 160, "n_mels": 40}
-    )
+def diarize_by_clustering(wav_path: str,
+                          segments: List[dict],
+                          max_speakers_try: int = 3) -> Tuple[List[dict], int]:
+    """
+    Build MFCC-based embeddings for each Whisper segment and cluster.
+    Try k=1..max_speakers_try; pick the one with best silhouette score.
+    Returns updated segments with 'speaker' and the chosen n_speakers.
+    """
+    y, sr = librosa.load(wav_path, sr=None, mono=True)
+    if not segments:
+        return segments, 1
 
     feats = []
+    for s in segments:
+        feats.append(_mfcc_stats(y, sr, s["start"], s["end"]))
+    X = np.vstack(feats)
+
+    # Edge case: only one segment
+    if len(segments) == 1 or max_speakers_try <= 1:
+        for s in segments:
+            s["speaker"] = "SPEAKER 1"
+        return segments, 1
+
+    best_labels, best_score, best_k = None, -1.0, 1
+    for k in range(1, max_speakers_try + 1):
+        if k == 1:
+            labels = np.zeros(len(segments), dtype=int)
+            score = -1.0
+        else:
+            try:
+                clustering = AgglomerativeClustering(n_clusters=k, linkage="ward")
+                labels = clustering.fit_predict(X)
+                # Ward uses Euclidean distance; silhouette on Euclidean:
+                if len(np.unique(labels)) > 1:
+                    score = silhouette_score(X, labels, metric="euclidean")
+                else:
+                    score = -1.0
+            except Exception:
+                score = -1.0
+                labels = np.zeros(len(segments), dtype=int)
+        if score > best_score:
+            best_score, best_k, best_labels = score, k, labels
+
+    # Assign speakers
+    for i, s in enumerate(segments):
+        s["speaker"] = f"SPEAKER {int(best_labels[i]) + 1}"
+    return segments, best_k
+
+def segments_to_text(segments: List[dict]) -> str:
+    """
+    Build a timestamped, speaker-labeled plain text transcript.
+    """
+    out = io.StringIO()
+    last_speaker = None
     for seg in segments:
-        start = max(0.0, float(seg["start"]))
-        end = max(start, float(seg["end"]))
-        s_idx = int(round(start * sr))
-        e_idx = min(len(wav), int(round(end * sr)))
-        if e_idx <= s_idx:
-            e_idx = min(len(wav), s_idx + int(0.2 * sr))  # pad tiny segments
-        clip = torch.from_numpy(wav[s_idx:e_idx]).float().unsqueeze(0)  # (1, T)
+        spk = seg.get("speaker", "SPEAKER 1")
+        if spk != last_speaker:
+            out.write(f"\n{spk} {format_timestamp(seg['start'])}\n")
+            last_speaker = spk
+        # Whisper sometimes includes leading space/punctuations
+        text = seg.get("text", "").lstrip()
+        out.write(text + " ")
+    return out.getvalue().strip() + "\n"
 
-        # MFCC shape: (1, n_mfcc, time)
-        with torch.no_grad():
-            mfcc = mfcc_tf(clip)
+def build_download_name(original_name: str) -> str:
+    base = os.path.splitext(_safe_filename(original_name or "transcript"))[0]
+    return f"{base}_diarized.txt"
 
-            # deltas
-            delta = AF.compute_deltas(mfcc)
-            delta2 = AF.compute_deltas(delta)
+# ---------- Main action ----------
+if uploaded is not None:
+    st.video(uploaded) if uploaded.type.startswith("video/") else st.audio(uploaded)
 
-            # aggregate over time: mean + std for each set
-            def agg(x: torch.Tensor) -> torch.Tensor:
-                # x: (1, C, T)
-                m = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0).mean(dim=-1)
-                s = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0).std(dim=-1, unbiased=False)
-                return torch.cat([m, s], dim=1)  # (1, 2*C)
+    do_transcribe = st.button("🔎 Transcribe & Diarize")
+    if do_transcribe:
+        with st.spinner("Loading model…"):
+            model = load_whisper(model_size)
 
-            v = torch.cat([agg(mfcc), agg(delta), agg(delta2)], dim=1)  # (1, 6*n_mfcc)
-            feats.append(v.squeeze(0).cpu().numpy())
+        # Save upload to disk
+        in_path = _to_tmp_file(uploaded)
 
-    embs = np.vstack(feats).astype(np.float32)
-    # Replace NaNs/Infs if any numerical issues
-    embs = np.nan_to_num(embs, nan=0.0, posinf=0.0, neginf=0.0)
-    return embs
-
-def pick_num_speakers(embs: np.ndarray, max_k: int) -> int:
-    """
-    Choose K in [1..max_k] by maximizing silhouette score (if K>1).
-    Fall back to 1 if not enough samples or degenerate clustering.
-    """
-    n = embs.shape[0]
-    if n < 3:
-        return 1
-    best_k, best_score = 1, -1.0
-    upper = max(2, min(max_k, n))
-    for k in range(2, upper + 1):
-        labels = AgglomerativeClustering(k).fit_predict(embs)
-        if len(set(labels)) < 2 or len(set(labels)) >= len(labels):
-            continue
         try:
-            score = silhouette_score(embs, labels)
-            if score > best_score:
-                best_score, best_k = score, k
-        except Exception:
-            pass
-    return best_k
+            with st.spinner("Converting media to WAV…"):
+                wav_path = _media_to_wav(in_path, sr=16000)
 
-def apply_speaker_labels(segments: List[Dict[str, Any]], labels: np.ndarray):
-    for i, seg in enumerate(segments):
-        seg["speaker"] = f"SPEAKER {int(labels[i]) + 1}"
-    return segments
+            decode_opts = {"task": "translate"} if enable_translate else {}
+            if language_hint.strip():
+                # Whisper accepts either language name or code; we’ll pass as-is
+                decode_opts["language"] = language_hint.strip()
 
-def to_txt(segments: List[Dict[str, Any]], show_ts: bool) -> str:
-    def hhmmss(s: float) -> str:
-        return str(datetime.timedelta(seconds=round(s)))
-    out = []
-    last = None
-    for seg in segments:
-        who = seg.get("speaker")
-        if who and who != last:
-            line = who
-            if show_ts:
-                line += f" {hhmmss(float(seg['start']))}"
-            out.append("\n" + line)
-            last = who
-        text = (seg.get("text") or "").strip()
-        if text:
-            out.append(text + " ")
-    return "".join(out).strip()
+            with st.spinner("Transcribing with Whisper…"):
+                result = model.transcribe(wav_path, **decode_opts)
+                segments = result.get("segments", []) or []
 
-def timestamped_filename(base: str, ext: str) -> str:
-    ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    base = os.path.splitext(os.path.basename(base))[0] or "transcript"
-    return f"{base}_transcript_{ts}.{ext}"
+            if min_segment_sec > 0:
+                segments = _merge_short_segments(segments, min_segment_sec)
 
+            with st.spinner("Diarizing (clustering per-segment features)…"):
+                segments, chosen_k = diarize_by_clustering(
+                    wav_path, segments, max_speakers_try=max_speakers
+                )
 
-# ------------------------------- Run -------------------------------
-if uploaded and st.button("Transcribe"):
-    try:
-        with st.spinner("Loading Whisper…"):
-            model, device = load_whisper(model_size)
-        st.info(f"Using device: **{device.upper()}**")
+            st.success(f"Done! Estimated speakers: {chosen_k}")
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Save upload to disk
-            in_path = os.path.join(tmpdir, uploaded.name)
-            with open(in_path, "wb") as f:
-                f.write(uploaded.read())
+            # Show a quick preview
+            st.subheader("Transcript (preview)")
+            preview = segments_to_text(segments)
+            st.text_area("Transcript", preview, height=300)
 
-            # 1) Convert to 16k mono WAV
-            with st.spinner("Converting to WAV…"):
-                wav_path = to_wav_mono16k(tmpdir, in_path)
+            # Provide a download
+            fname = build_download_name(uploaded.name)
+            st.download_button(
+                "⬇️ Download diarized transcript (.txt)",
+                data=preview.encode("utf-8"),
+                file_name=fname,
+                mime="text/plain",
+            )
 
-            # 2) Transcribe with Whisper
-            with st.spinner("Transcribing…"):
-                result = transcribe_whisper(model, wav_path, device, language_code)
-                segments = result.get("segments", [])
-                if not segments:
-                    st.error("No segments returned by Whisper.")
-                    st.stop()
-
-            # 3) Speaker labeling via MFCC clustering
-            with st.spinner("Labeling speakers…"):
-                labels_used = False
-                try:
-                    embs = segment_mfcc_embeddings(wav_path, segments)
-                    k = (pick_num_speakers(embs, max_auto) if auto_speakers else int(num_speakers))
-                    if k > 1:
-                        labels = AgglomerativeClustering(k).fit_predict(embs)
-                        apply_speaker_labels(segments, labels)
-                        labels_used = True
-                except Exception as e:
-                    st.warning("Speaker labeling failed; continuing with plain transcript.\n\n"
-                               f"Details: {e}")
-
-            # 4) Render + download
-            txt = to_txt(segments, show_timestamps)
-            st.subheader("Transcript")
-            st.write(txt
+        except Exception as e:
+            st.error(f"Processing failed: {e}")
+        finally:
+            # best-effort cleanup
+            try:
+                if os.path.exists(in_path): os.remove(in_path)
+            except Exception:
+                pass
