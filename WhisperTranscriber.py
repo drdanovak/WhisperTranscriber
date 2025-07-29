@@ -1,9 +1,5 @@
-# WhisperTranscriber.py
-# Streamlit app for transcription with optional speaker labeling
-# - OpenAI Whisper for ASR
-# - Optional "speaker labels" by clustering ECAPA embeddings (SpeechBrain)
-# - Outputs: TXT, SRT, VTT, JSON
-# - Uses imageio-ffmpeg binary so no system ffmpeg is required
+# app.py
+# Whisper diarized transcription in Streamlit, designed to be foolproof on Streamlit Cloud.
 
 import os
 import io
@@ -11,74 +7,73 @@ import json
 import tempfile
 import subprocess
 import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import numpy as np
 from sklearn.cluster import AgglomerativeClustering
+from sklearn.metrics import silhouette_score
 
 import streamlit as st
 
-# Core ASR
+# ASR
 import torch
 import whisper
 
-# WAV conversion without system ffmpeg
-import imageio_ffmpeg
-
-# Audio I/O for segment slicing
+# Audio I/O / conversion
 import soundfile as sf
-
-# SpeechBrain ECAPA speaker embeddings
-from speechbrain.pretrained import EncoderClassifier
+import imageio_ffmpeg
 
 
 # ------------------------------ UI --------------------------------
-st.set_page_config(page_title="Whisper Transcriber", layout="wide")
-st.title("Whisper Transcriber (Streamlit)")
-st.caption("Transcribe audio/video with Whisper. Optionally add simple speaker labels by clustering ECAPA embeddings.")
+st.set_page_config(page_title="Whisper Diarized Transcriber", layout="centered")
+st.title("Whisper Diarized Transcriber")
+st.caption("Upload audio/video → transcribe with Whisper → cluster speakers → download a timestamped .txt transcript.")
 
 with st.sidebar:
     st.header("Settings")
     model_size = st.selectbox(
         "Whisper model",
-        ["tiny", "base", "small", "medium", "large"],
-        index=4,
+        ["small", "medium", "large"],
+        index=0,
         help="Larger models are more accurate but slower."
     )
-
-    language_choice = st.selectbox(
+    language_mode = st.selectbox(
         "Language",
-        ["auto", "English", "Specify code…"],
+        ["Auto-detect", "English", "Specify code…"],
         index=1,
-        help="Use 'auto' for language detection, or specify a BCP‑47 code (e.g., 'es', 'fr')."
+        help="Use 'Auto-detect' or specify a language code (e.g., en, es, fr)."
     )
-    language_code = None
-    if language_choice == "English":
+    language_code: Optional[str] = None
+    if language_mode == "English":
         language_code = "en"
-    elif language_choice == "Specify code…":
-        language_code = st.text_input("Language code (e.g., en, es, fr, de, pt-BR)", value="en").strip() or None
+    elif language_mode == "Specify code…":
+        language_code = st.text_input("Language code (BCP-47)", value="en").strip() or None
 
-    use_speaker_labels = st.checkbox(
-        "Add speaker labels (cluster ECAPA embeddings)",
+    auto_speakers = st.checkbox(
+        "Auto-detect number of speakers",
         value=True,
-        help="Approximates diarization by clustering per‑segment embeddings."
+        help="Tries 1–6 and picks the best clustering. Uncheck to set it manually."
     )
+    max_auto = st.slider("Auto-detect: max speakers to try", 2, 8, 6, disabled=not auto_speakers)
     num_speakers = st.number_input(
-        "Number of speakers (if labeling)",
-        min_value=1, max_value=20, value=2, step=1
+        "Speakers (manual)", min_value=1, max_value=20, value=2, step=1, disabled=auto_speakers
     )
-    show_timestamps = st.checkbox("Show timestamps in TXT output", value=True)
+
+    show_timestamps = st.checkbox("Show timestamps in TXT", value=True)
 
 uploaded = st.file_uploader(
-    "Upload an audio or video file",
-    type=["wav", "mp3", "m4a", "mp4", "mov", "aac", "flac", "ogg", "webm", "wma", "mkv", "avi"]
+    "Upload audio or video",
+    type=[
+        "wav", "mp3", "m4a", "mp4", "mov", "aac", "flac", "ogg", "webm",
+        "wma", "mkv", "avi", "m4v", "3gp"
+    ],
+    accept_multiple_files=False
 )
 if uploaded:
     try:
         st.audio(uploaded)
     except Exception:
         pass
-
 
 # --------------------------- Helpers & Cache -----------------------
 @st.cache_resource(show_spinner=False)
@@ -89,41 +84,35 @@ def load_whisper(model_size: str):
 
 @st.cache_resource(show_spinner=False)
 def load_ecapa(device: str):
-    # SpeechBrain ECAPA-voxceleb embedding model
+    # Lazy import to keep top-level import list minimal
+    from speechbrain.pretrained import EncoderClassifier
     return EncoderClassifier.from_hparams(
         source="speechbrain/spkrec-ecapa-voxceleb",
         run_opts={"device": device}
     )
 
-def get_ffmpeg_bin() -> str:
+def ffmpeg_bin() -> str:
     return imageio_ffmpeg.get_ffmpeg_exe()
 
-def ensure_wav(tmp_dir: str, input_path: str) -> str:
+def to_wav_mono16k(tmpdir: str, infile_path: str) -> str:
     """
-    Convert the input file to mono 16 kHz WAV via bundled ffmpeg.
+    Convert any media to 16kHz mono WAV using a bundled ffmpeg binary.
     """
-    if input_path.lower().endswith(".wav"):
-        # still standardize to 16k mono to simplify downstream
-        wav_path = os.path.join(tmp_dir, "audio.wav")
-        ffmpeg_bin = get_ffmpeg_bin()
-        subprocess.run(
-            [ffmpeg_bin, "-y", "-i", input_path, "-ac", "1", "-ar", "16000", wav_path],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
-        )
-        return wav_path if os.path.exists(wav_path) else input_path
-
-    wav_path = os.path.join(tmp_dir, "audio.wav")
-    ffmpeg_bin = get_ffmpeg_bin()
-    completed = subprocess.run(
-        [ffmpeg_bin, "-y", "-i", input_path, "-ac", "1", "-ar", "16000", wav_path],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE
-    )
-    if completed.returncode != 0 or not os.path.exists(wav_path):
-        stderr = completed.stderr.decode("utf-8", errors="ignore")
-        raise RuntimeError(f"ffmpeg failed to convert to WAV:\n{stderr[:2000]}")
+    wav_path = os.path.join(tmpdir, "audio_16k_mono.wav")
+    cmd = [
+        ffmpeg_bin(), "-y",
+        "-i", infile_path,
+        "-ac", "1",     # mono
+        "-ar", "16000", # 16 kHz
+        wav_path
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0 or not os.path.exists(wav_path):
+        err = proc.stderr.decode("utf-8", errors="ignore")
+        raise RuntimeError(f"ffmpeg conversion failed:\n{err[:2000]}")
     return wav_path
 
-def transcribe_file(model, wav_path: str, device: str, language_code: str | None):
+def transcribe_whisper(model, wav_path: str, device: str, language_code: Optional[str]):
     kwargs = {
         "language": language_code,
         "verbose": False,
@@ -132,34 +121,58 @@ def transcribe_file(model, wav_path: str, device: str, language_code: str | None
         kwargs["fp16"] = False
     return model.transcribe(wav_path, **kwargs)
 
-def compute_ecapa_embeddings(wav_path: str, segments: List[Dict[str, Any]], ecapa: EncoderClassifier):
+def compute_ecapa_embeddings(wav_path: str, segments: List[Dict[str, Any]], device: str):
     """
-    Compute ECAPA embeddings for each Whisper segment using SpeechBrain directly.
-    Assumes wav_path is mono 16kHz (we enforce this in ensure_wav).
-    Returns an array of shape (N, D).
+    Compute an ECAPA embedding per Whisper segment using SpeechBrain.
+    - Uses soundfile to slice the 16k mono WAV.
+    - Returns (N, D) float32 array.
     """
-    # Load full waveform once for efficient slicing
-    waveform, sr = sf.read(wav_path, dtype="float32", always_2d=False)
-    if waveform.ndim > 1:
-        # ensure mono
-        waveform = waveform.mean(axis=1)
-    # SpeechBrain expects torch tensors with shape (batch, time)
-    embeddings = []
+    import torch as _torch
+    ecapa = load_ecapa(device)
+
+    # Load mono waveform (float32)
+    wav, sr = sf.read(wav_path, dtype="float32", always_2d=False)
+    if wav.ndim > 1:
+        wav = wav.mean(axis=1)  # safety
+
+    embs = []
     for seg in segments:
-        start = max(0, int(round(float(seg["start"]) * sr)))
-        end = min(len(waveform), int(round(float(seg["end"]) * sr)))
-        if end <= start:
-            # tiny/zero-length segment: pad a small slice
-            end = min(len(waveform), start + int(0.2 * sr))
-        clip = torch.from_numpy(waveform[start:end]).unsqueeze(0)  # (1, T)
-        with torch.no_grad():
-            emb = ecapa.encode_batch(clip)  # (1, 192)
-        embeddings.append(emb.squeeze(0).squeeze(0).cpu().numpy())
-    embs = np.vstack(embeddings).astype(np.float32)
-    # Avoid NaNs in clustering
+        start_s = max(0.0, float(seg["start"]))
+        end_s = max(start_s, float(seg["end"]))
+        s_idx = int(round(start_s * sr))
+        e_idx = min(len(wav), int(round(end_s * sr)))
+        if e_idx <= s_idx:  # guard against zero-length
+            e_idx = min(len(wav), s_idx + int(0.2 * sr))
+        clip = _torch.from_numpy(wav[s_idx:e_idx]).unsqueeze(0)  # (1, T)
+        with _torch.no_grad():
+            emb = ecapa.encode_batch(clip)  # (1, 1, 192)
+        embs.append(emb.squeeze().cpu().numpy())  # (192,)
+    embs = np.vstack(embs).astype(np.float32)
     return np.nan_to_num(embs)
 
-def label_speakers(segments: List[Dict[str, Any]], labels: np.ndarray):
+def pick_num_speakers(embs: np.ndarray, max_k: int) -> int:
+    """
+    Choose K in [1..max_k] by maximizing silhouette score (if K>1).
+    If all poor, fall back to 1.
+    """
+    if embs.shape[0] < 3:
+        return 1
+    best_k, best_score = 1, -1.0
+    for k in range(2, max(2, min(max_k, embs.shape[0])) + 1):
+        labels = AgglomerativeClustering(k).fit_predict(embs)
+        # Need at least 2 clusters and less than n_samples unique labels
+        if len(set(labels)) < 2 or len(set(labels)) >= len(labels):
+            continue
+        try:
+            score = silhouette_score(embs, labels)
+            if score > best_score:
+                best_score, best_k = score, k
+        except Exception:
+            # Occasionally fails for degenerate embeddings; ignore and continue
+            pass
+    return best_k
+
+def apply_speaker_labels(segments: List[Dict[str, Any]], labels: np.ndarray):
     for i, seg in enumerate(segments):
         seg["speaker"] = f"SPEAKER {int(labels[i]) + 1}"
     return segments
@@ -172,62 +185,28 @@ def srt_time(s: float) -> str:
     hour = ms_total // 3600000
     return f"{hour:02d}:{minute:02d}:{sec:02d},{ms:03d}"
 
-def vtt_time(s: float) -> str:
-    ms_total = int(round(s * 1000))
-    ms = ms_total % 1000
-    sec = (ms_total // 1000) % 60
-    minute = (ms_total // 60000) % 60
-    hour = ms_total // 3600000
-    return f"{hour:02d}:{minute:02d}:{sec:02d}.{ms:03d}"
-
-def to_srt(segments: List[Dict[str, Any]]) -> str:
-    lines = []
-    for i, seg in enumerate(segments, 1):
-        start = srt_time(float(seg["start"]))
-        end = srt_time(float(seg["end"]))
-        who = f"{seg.get('speaker', '').strip()} " if seg.get("speaker") else ""
-        text = (seg.get("text") or "").strip()
-        lines.append(f"{i}\n{start} --> {end}\n{who}{text}\n")
-    return "\n".join(lines)
-
-def to_vtt(segments: List[Dict[str, Any]]) -> str:
-    out = ["WEBVTT\n"]
-    for seg in segments:
-        out.append(f"{vtt_time(float(seg['start']))} --> {vtt_time(float(seg['end']))}")
-        who = f"{seg.get('speaker', '').strip()} " if seg.get("speaker") else ""
-        text = (seg.get("text") or "").strip()
-        out.append(f"{who}{text}\n")
-    return "\n".join(out)
-
-def to_txt(segments: List[Dict[str, Any]], show_timestamps: bool) -> str:
-    def ts(s: float) -> str:
+def to_txt(segments: List[Dict[str, Any]], show_ts: bool) -> str:
+    def hhmmss(s: float) -> str:
         return str(datetime.timedelta(seconds=round(s)))
-    buf = []
-    last_speaker = None
+    out = []
+    last = None
     for seg in segments:
-        speaker = seg.get("speaker")
-        if speaker and speaker != last_speaker:
-            buf.append(f"\n{speaker}")
-            if show_timestamps:
-                buf.append(f" {ts(float(seg['start']))}")
-            buf.append("\n")
-            last_speaker = speaker
+        who = seg.get("speaker")
+        if who and who != last:
+            line = who
+            if show_ts:
+                line += f" {hhmmss(float(seg['start']))}"
+            out.append("\n" + line)
+            last = who
         text = (seg.get("text") or "").strip()
         if text:
-            buf.append(text + " ")
-    return "".join(buf).strip()
+            out.append(text + " ")
+    return "".join(out).strip()
 
-def to_json(segments: List[Dict[str, Any]]) -> str:
-    cleaned = [
-        {
-            "start": float(s["start"]),
-            "end": float(s["end"]),
-            "text": (s.get("text") or "").strip(),
-            "speaker": s.get("speaker"),
-        }
-        for s in segments
-    ]
-    return json.dumps(cleaned, indent=2)
+def timestamped_filename(base: str, ext: str) -> str:
+    ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    base = os.path.splitext(os.path.basename(base))[0] or "transcript"
+    return f"{base}_transcript_{ts}.{ext}"
 
 
 # ------------------------------- Run -------------------------------
@@ -238,53 +217,51 @@ if uploaded and st.button("Transcribe"):
         st.info(f"Using device: **{device.upper()}**")
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Save upload
+            # Save upload to disk
             in_path = os.path.join(tmpdir, uploaded.name)
             with open(in_path, "wb") as f:
                 f.write(uploaded.read())
 
-            # Convert to WAV (16 kHz mono)
+            # 1) Convert to 16k mono WAV
             with st.spinner("Converting to WAV…"):
-                wav_path = ensure_wav(tmpdir, in_path)
+                wav_path = to_wav_mono16k(tmpdir, in_path)
 
-            # Transcribe
-            with st.spinner("Transcribing… (large files/models may take a while)"):
-                result = transcribe_file(model, wav_path, device, language_code)
+            # 2) Transcribe with Whisper
+            with st.spinner("Transcribing…"):
+                result = transcribe_whisper(model, wav_path, device, language_code)
                 segments = result.get("segments", [])
                 if not segments:
                     st.error("No segments returned by Whisper.")
                     st.stop()
 
-            # Optional speaker labeling
-            if use_speaker_labels and len(segments) > 1:
+            # 3) Diarize (cluster embeddings)
+            with st.spinner("Labeling speakers…"):
+                labels_used = False
                 try:
-                    with st.spinner("Computing speaker embeddings…"):
-                        ecapa = load_ecapa(device)
-                        embs = compute_ecapa_embeddings(wav_path, segments, ecapa)
-
-                    with st.spinner("Clustering speakers…"):
-                        clustering = AgglomerativeClustering(num_speakers).fit(embs)
-                        labels = clustering.labels_
-                        segments = label_speakers(segments, labels)
+                    embs = compute_ecapa_embeddings(wav_path, segments, device)
+                    k = (pick_num_speakers(embs, max_auto) if auto_speakers else int(num_speakers))
+                    if k > 1:
+                        labels = AgglomerativeClustering(k).fit_predict(embs)
+                        apply_speaker_labels(segments, labels)
+                        labels_used = True
                 except Exception as e:
                     st.warning(
                         "Speaker labeling failed; continuing with plain transcript.\n\n"
                         f"Details: {e}"
                     )
 
-            # ---------------- Outputs ----------------
-            txt = to_txt(segments, show_timestamps=show_timestamps)
-            srt = to_srt(segments)
-            vtt = to_vtt(segments)
-            js = to_json(segments)
-
+            # 4) Render + download
+            txt = to_txt(segments, show_timestamps)
             st.subheader("Transcript")
             st.write(txt if txt else "(empty)")
 
-            st.download_button("Download TXT", data=txt.encode("utf-8"), file_name="transcript.txt")
-            st.download_button("Download SRT", data=srt.encode("utf-8"), file_name="transcript.srt")
-            st.download_button("Download VTT", data=vtt.encode("utf-8"), file_name="transcript.vtt")
-            st.download_button("Download JSON", data=js.encode("utf-8"), file_name="segments.json")
+            fname = timestamped_filename(uploaded.name, "txt")
+            st.download_button("Download transcript (.txt)", data=txt.encode("utf-8"), file_name=fname)
+
+            if labels_used:
+                st.success("Done! Transcription + speaker labels ready.")
+            else:
+                st.success("Done! Transcription ready.")
 
     except Exception as e:
         st.error(f"Unexpected error: {e}")
