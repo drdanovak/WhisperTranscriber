@@ -1,5 +1,6 @@
 # app.py
-# Whisper diarized transcription in Streamlit, designed to be foolproof on Streamlit Cloud.
+# Whisper-based transcription with simple, dependency-light speaker labeling.
+# Designed to run reliably on Streamlit Cloud (Python 3.13, CPU).
 
 import os
 import io
@@ -23,11 +24,14 @@ import whisper
 import soundfile as sf
 import imageio_ffmpeg
 
+# Lightweight acoustic features for clustering
+import librosa
+
 
 # ------------------------------ UI --------------------------------
 st.set_page_config(page_title="Whisper Diarized Transcriber", layout="centered")
 st.title("Whisper Diarized Transcriber")
-st.caption("Upload audio/video → transcribe with Whisper → cluster speakers → download a timestamped .txt transcript.")
+st.caption("Upload audio/video → transcribe with Whisper → cluster speakers (MFCCs) → download a timestamped .txt file.")
 
 with st.sidebar:
     st.header("Settings")
@@ -52,7 +56,7 @@ with st.sidebar:
     auto_speakers = st.checkbox(
         "Auto-detect number of speakers",
         value=True,
-        help="Tries 1–6 and picks the best clustering. Uncheck to set it manually."
+        help="Tries 1–6 and picks the best clustering. Uncheck to set manually."
     )
     max_auto = st.slider("Auto-detect: max speakers to try", 2, 8, 6, disabled=not auto_speakers)
     num_speakers = st.number_input(
@@ -75,21 +79,13 @@ if uploaded:
     except Exception:
         pass
 
+
 # --------------------------- Helpers & Cache -----------------------
 @st.cache_resource(show_spinner=False)
 def load_whisper(model_size: str):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = whisper.load_model(model_size, device=device)
     return model, device
-
-@st.cache_resource(show_spinner=False)
-def load_ecapa(device: str):
-    # Lazy import to keep top-level import list minimal
-    from speechbrain.pretrained import EncoderClassifier
-    return EncoderClassifier.from_hparams(
-        source="speechbrain/spkrec-ecapa-voxceleb",
-        run_opts={"device": device}
-    )
 
 def ffmpeg_bin() -> str:
     return imageio_ffmpeg.get_ffmpeg_exe()
@@ -121,46 +117,69 @@ def transcribe_whisper(model, wav_path: str, device: str, language_code: Optiona
         kwargs["fp16"] = False
     return model.transcribe(wav_path, **kwargs)
 
-def compute_ecapa_embeddings(wav_path: str, segments: List[Dict[str, Any]], device: str):
+def segment_mfcc_embeddings(
+    wav_path: str,
+    segments: List[Dict[str, Any]],
+    n_mfcc: int = 20,
+    sr_expected: int = 16000,
+) -> np.ndarray:
     """
-    Compute an ECAPA embedding per Whisper segment using SpeechBrain.
-    - Uses soundfile to slice the 16k mono WAV.
-    - Returns (N, D) float32 array.
+    Compute a simple MFCC-based embedding per Whisper segment.
+    We average MFCCs (and deltas) over time to get a compact vector.
     """
-    import torch as _torch
-    ecapa = load_ecapa(device)
-
-    # Load mono waveform (float32)
+    # Load the 16k mono we created (guaranteed by to_wav_mono16k)
     wav, sr = sf.read(wav_path, dtype="float32", always_2d=False)
     if wav.ndim > 1:
-        wav = wav.mean(axis=1)  # safety
+        wav = wav.mean(axis=1)
+    if sr != sr_expected:
+        # Safety: resample with librosa if somehow not 16k
+        wav = librosa.resample(wav, orig_sr=sr, target_sr=sr_expected)
+        sr = sr_expected
 
-    embs = []
+    feats = []
     for seg in segments:
-        start_s = max(0.0, float(seg["start"]))
-        end_s = max(start_s, float(seg["end"]))
-        s_idx = int(round(start_s * sr))
-        e_idx = min(len(wav), int(round(end_s * sr)))
-        if e_idx <= s_idx:  # guard against zero-length
+        start = max(0.0, float(seg["start"]))
+        end = max(start, float(seg["end"]))
+        s_idx = int(round(start * sr))
+        e_idx = min(len(wav), int(round(end * sr)))
+        if e_idx <= s_idx:
+            # guard tiny/zero-length segments
             e_idx = min(len(wav), s_idx + int(0.2 * sr))
-        clip = _torch.from_numpy(wav[s_idx:e_idx]).unsqueeze(0)  # (1, T)
-        with _torch.no_grad():
-            emb = ecapa.encode_batch(clip)  # (1, 1, 192)
-        embs.append(emb.squeeze().cpu().numpy())  # (192,)
-    embs = np.vstack(embs).astype(np.float32)
-    return np.nan_to_num(embs)
+        clip = wav[s_idx:e_idx]
+        if len(clip) < int(0.1 * sr):  # very short: pad a bit
+            pad = int(0.1 * sr) - len(clip)
+            clip = np.pad(clip, (0, max(0, pad)))
+
+        # MFCCs
+        mfcc = librosa.feature.mfcc(y=clip, sr=sr, n_mfcc=n_mfcc)  # (n_mfcc, T)
+        delta = librosa.feature.delta(mfcc)
+        delta2 = librosa.feature.delta(mfcc, order=2)
+
+        # Aggregate over time (mean + std)
+        v = np.concatenate([
+            mfcc.mean(axis=1), mfcc.std(axis=1),
+            delta.mean(axis=1), delta.std(axis=1),
+            delta2.mean(axis=1), delta2.std(axis=1),
+        ]).astype(np.float32)
+        feats.append(v)
+
+    embs = np.vstack(feats)
+    # Replace NaNs/Infs if any numerical issues
+    embs = np.nan_to_num(embs, nan=0.0, posinf=0.0, neginf=0.0)
+    return embs
 
 def pick_num_speakers(embs: np.ndarray, max_k: int) -> int:
     """
     Choose K in [1..max_k] by maximizing silhouette score (if K>1).
     If all poor, fall back to 1.
     """
-    if embs.shape[0] < 3:
+    n = embs.shape[0]
+    if n < 3:
         return 1
     best_k, best_score = 1, -1.0
-    for k in range(2, max(2, min(max_k, embs.shape[0])) + 1):
+    upper = max(2, min(max_k, n))  # can’t exceed number of samples
+    for k in range(2, upper + 1):
         labels = AgglomerativeClustering(k).fit_predict(embs)
-        # Need at least 2 clusters and less than n_samples unique labels
         if len(set(labels)) < 2 or len(set(labels)) >= len(labels):
             continue
         try:
@@ -168,7 +187,6 @@ def pick_num_speakers(embs: np.ndarray, max_k: int) -> int:
             if score > best_score:
                 best_score, best_k = score, k
         except Exception:
-            # Occasionally fails for degenerate embeddings; ignore and continue
             pass
     return best_k
 
@@ -234,11 +252,11 @@ if uploaded and st.button("Transcribe"):
                     st.error("No segments returned by Whisper.")
                     st.stop()
 
-            # 3) Diarize (cluster embeddings)
+            # 3) Speaker labeling via MFCC clustering
             with st.spinner("Labeling speakers…"):
                 labels_used = False
                 try:
-                    embs = compute_ecapa_embeddings(wav_path, segments, device)
+                    embs = segment_mfcc_embeddings(wav_path, segments)
                     k = (pick_num_speakers(embs, max_auto) if auto_speakers else int(num_speakers))
                     if k > 1:
                         labels = AgglomerativeClustering(k).fit_predict(embs)
