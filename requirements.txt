@@ -1,22 +1,18 @@
-# Prefer PyPI first; use PyTorch CPU wheels as an extra index.
 --index-url https://pypi.org/simple
 --extra-index-url https://download.pytorch.org/whl/cpu
 
-# Whisper (Py3.13 wheels exist)
+# Whisper (Py3.13 friendly)
 openai-whisper==20250625
 
-# PyTorch (CPU-only for reliability on Streamlit Cloud)
+# PyTorch CPU-only wheels for reliability on Streamlit Cloud
 torch==2.7.1+cpu
 torchaudio==2.7.1+cpu
 
-# Scientific stack (Py3.13 wheels)
+# Scientific stack (no numba/llvmlite now)
 numpy==2.3.2
 scipy==1.16.1
 scikit-learn==1.7.1
 soundfile==0.13.1
-librosa==0.10.2.post1
-numba==0.61.2
-llvmlite==0.44.0
 
 # Streamlit app
 streamlit==1.47.1
