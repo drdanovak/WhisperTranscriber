@@ -1,19 +1,23 @@
-# Use CPU wheels for PyTorch (works on Streamlit Cloud)
+# CPU PyTorch wheels for Streamlit Cloud
 --extra-index-url https://download.pytorch.org/whl/cpu
 
-# Core ASR (versions with Py3.13 wheels)
+# Whisper (Py3.13 wheels available)
 openai-whisper==20250625
+
+# PyTorch (CPU-only for reliability on Streamlit Cloud)
 torch==2.7.1+cpu
 torchaudio==2.7.1+cpu
+
+# Core scientific stack
 numpy==2.2.6
-
-# Streamlit app + clustering
-streamlit==1.47.1
 scikit-learn==1.7.1
-
-# Speaker embeddings (ECAPA) without sentencepiece
-speechbrain==0.5.16
-
-# Audio I/O & bundled ffmpeg
 soundfile==0.13.1
+
+# Streamlit
+streamlit==1.47.1
+
+# Bundled ffmpeg (no system packages needed)
 imageio-ffmpeg==0.6.0
+
+# Speaker embeddings via SpeechBrain (older, lightweight version => no sentencepiece build)
+speechbrain==0.5.16
