@@ -1,37 +1,76 @@
 import io
 import os
+import sys
+import gc
 import tempfile
 import subprocess
-from datetime import timedelta
 from typing import List, Tuple
 
 import streamlit as st
 
-# ---------- Ensure a working ffmpeg (bundled) ----------
-# imageio-ffmpeg wheels ship a statically linked ffmpeg binary.
-import imageio_ffmpeg  # installs an ffmpeg exe inside the wheel
+# ------------------ Environment hardening for small CPU hosts ------------------
+# Use the statically-linked ffmpeg from imageio-ffmpeg (no system ffmpeg needed)
+import imageio_ffmpeg
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
-# Make the binary discoverable for anything that shells out to "ffmpeg"
 os.environ.setdefault("IMAGEIO_FFMPEG_EXE", FFMPEG_EXE)
 os.environ["PATH"] = os.path.dirname(FFMPEG_EXE) + os.pathsep + os.environ.get("PATH", "")
 
-# ---------- Whisper ----------
+# Torch & Whisper runtime knobs (reduce RAM & thread contention)
+os.environ.setdefault("WHISPER_DISABLE_FP16", "1")      # don’t try FP16 on CPU
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+import torch
+torch.set_num_threads(max(1, int(os.environ.get("OMP_NUM_THREADS", "1"))))
+
 import whisper
 from whisper.utils import format_timestamp
 
-# ---------- Diarization: lightweight, no external model ----------
 import numpy as np
 import librosa
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.metrics import silhouette_score
 
-# ---------- Page ----------
+# Optional: detect available RAM and adapt model choices
+def _available_memory_gb() -> float:
+    try:
+        import psutil
+        return psutil.virtual_memory().total / (1024**3)
+    except Exception:
+        # Fallback if psutil isn’t present (Streamlit Cloud often has ~2–4 GB)
+        return 2.0
+
+# ------------------ Streamlit UI ------------------
 st.set_page_config(page_title="Whisper Diarized Transcriber", layout="centered")
 st.title("🎙️ Whisper Diarized Transcriber")
-st.caption("Upload audio/video → transcribe with Whisper → diarize → download timestamped transcript")
+
+st.markdown(
+    """
+Upload **audio/video**, we’ll:
+
+1. Convert to mono 16 kHz WAV (bundled `ffmpeg`)  
+2. Transcribe with Whisper (local CPU)  
+3. **Diarize** by clustering MFCC features  
+4. Let you **download** a timestamped transcript with **speaker labels**
+    """
+)
+
+# Choose safe model set based on RAM
+mem_gb = _available_memory_gb()
+if mem_gb >= 5:
+    allowed_models = ["base", "small"]  # “medium” intentionally disabled for Cloud stability
+else:
+    allowed_models = ["base"]
 
 with st.expander("⚙️ Settings"):
-    model_size = st.selectbox("Whisper model", ["base", "small", "medium"], index=1)
+    model_size = st.selectbox(
+        "Whisper model",
+        allowed_models,
+        index=0,
+        help="‘base’ is lightest and recommended for CPU hosts. ‘small’ needs more RAM."
+    )
     language_hint = st.text_input("Language hint (optional)", value="")
     translate_to_en = st.checkbox("Translate to English (if supported)", value=False)
     max_speakers = st.slider("Max speakers to try (auto-select 1..N)", 1, 6, 3)
@@ -42,14 +81,15 @@ uploaded = st.file_uploader(
     type=["mp3","mp4","mpeg","mpga","m4a","wav","webm","flac","ogg","opus","mkv","mov","avi"],
 )
 
-# ---------- Helpers ----------
+# ------------------ Helpers ------------------
 def _safe_filename(name: str) -> str:
     keep = "-_.() "
     return "".join(c for c in name if c.isalnum() or c in keep).strip().replace(" ", "_")
 
 @st.cache_resource(show_spinner=False)
 def load_whisper(model_name: str):
-    return whisper.load_model(model_name)
+    # Force CPU device and deterministic options to keep memory down
+    return whisper.load_model(model_name, device="cpu", in_memory=True)
 
 def _save_to_tmp(uploaded_file) -> str:
     suffix = os.path.splitext(uploaded_file.name)[1].lower() or ".bin"
@@ -60,9 +100,6 @@ def _save_to_tmp(uploaded_file) -> str:
     return f.name
 
 def _media_to_wav(input_path: str, sr: int = 16000) -> str:
-    """
-    Convert any media to mono 16 kHz WAV via the bundled ffmpeg.
-    """
     out_path = tempfile.mktemp(suffix=".wav")
     cmd = [
         FFMPEG_EXE, "-y",
@@ -71,11 +108,10 @@ def _media_to_wav(input_path: str, sr: int = 16000) -> str:
         "-ar", str(sr),
         out_path,
     ]
-    # Use subprocess for reliability and surfacing stderr on failure
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"ffmpeg failed: {e.stderr.decode(errors='ignore')[:500]}") from e
+        raise RuntimeError(f"ffmpeg failed: {e.stderr.decode(errors='ignore')[:600]}") from e
     if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
         raise RuntimeError("ffmpeg produced no output WAV.")
     return out_path
@@ -88,7 +124,6 @@ def _merge_short_segments(segments: List[dict], threshold_sec: float) -> List[di
     for nxt in segments[1:]:
         dur = cur["end"] - cur["start"]
         if dur < threshold_sec:
-            # merge with next
             cur["end"] = nxt["start"]
             cur["text"] = (cur.get("text","") + " " + nxt.get("text","")).strip()
             nxt["start"] = cur["start"]
@@ -100,16 +135,12 @@ def _merge_short_segments(segments: List[dict], threshold_sec: float) -> List[di
     return merged
 
 def _mfcc_stats(y: np.ndarray, sr: int, start: float, end: float, n_mfcc=20) -> np.ndarray:
-    """
-    Extract MFCCs in [start, end] and return mean+std vector.
-    """
     s0 = max(0, int(start * sr))
     s1 = min(len(y), int(end * sr))
     if s1 <= s0:
         s1 = min(len(y), s0 + int(0.1 * sr))
     clip = y[s0:s1]
     if clip.size == 0:
-        # fallback tiny window
         clip = y[max(0, s0 - int(0.1*sr)):min(len(y), s0 + int(0.1*sr))]
     mfcc = librosa.feature.mfcc(y=clip.astype(np.float32), sr=sr, n_mfcc=n_mfcc)
     mu = mfcc.mean(axis=1)
@@ -117,10 +148,6 @@ def _mfcc_stats(y: np.ndarray, sr: int, start: float, end: float, n_mfcc=20) -> 
     return np.concatenate([mu, sd])
 
 def diarize_by_clustering(wav_path: str, segments: List[dict], max_k: int) -> Tuple[List[dict], int]:
-    """
-    Build MFCC embeddings per Whisper segment and cluster.
-    Try k=1..max_k and select the one with the best silhouette score (Euclidean).
-    """
     if not segments:
         return segments, 1
     y, sr = librosa.load(wav_path, sr=None, mono=True)
@@ -146,9 +173,6 @@ def diarize_by_clustering(wav_path: str, segments: List[dict], max_k: int) -> Tu
     return segments, best_k
 
 def segments_to_text(segments: List[dict]) -> str:
-    """
-    Build a timestamped, speaker-labeled plain text transcript.
-    """
     out = io.StringIO()
     last_speaker = None
     for seg in segments:
@@ -163,9 +187,8 @@ def _download_name(original: str) -> str:
     base = os.path.splitext(_safe_filename(original or "transcript"))[0]
     return f"{base}_diarized.txt"
 
-# ---------- Main ----------
+# ------------------ Main flow ------------------
 if uploaded is not None:
-    # Preview
     if uploaded.type.startswith("video/"):
         st.video(uploaded)
     else:
@@ -173,14 +196,18 @@ if uploaded is not None:
 
     if st.button("🔎 Transcribe & Diarize"):
         tmp_in = _save_to_tmp(uploaded)
+        wav_path = None
         try:
             with st.spinner("Converting media to WAV…"):
                 wav_path = _media_to_wav(tmp_in, sr=16000)
 
-            with st.spinner("Loading Whisper model…"):
+            with st.spinner(f"Loading Whisper model ({model_size})…"):
                 model = load_whisper(model_size)
 
-            decode_opts = {"task": "translate"} if translate_to_en else {}
+            # Keep decoding options lean for CPU
+            decode_opts = dict(temperature=0.0, beam_size=1, condition_on_previous_text=False)
+            if translate_to_en:
+                decode_opts["task"] = "translate"
             if language_hint.strip():
                 decode_opts["language"] = language_hint.strip()
 
@@ -196,7 +223,6 @@ if uploaded is not None:
 
             st.success(f"Done! Estimated speakers: {chosen_k}")
 
-            # Preview & download
             st.subheader("Transcript (preview)")
             text_out = segments_to_text(segments)
             st.text_area("Transcript", text_out, height=320)
@@ -207,10 +233,17 @@ if uploaded is not None:
                 file_name=_download_name(uploaded.name),
                 mime="text/plain",
             )
+
         except Exception as e:
             st.error(f"Processing failed: {e}")
         finally:
-            for p in [tmp_in, locals().get("wav_path")]:
+            # free memory aggressively on small hosts
+            try:
+                del result, segments  # type: ignore
+            except Exception:
+                pass
+            gc.collect()
+            for p in [tmp_in, wav_path]:
                 try:
                     if p and os.path.exists(p):
                         os.remove(p)
