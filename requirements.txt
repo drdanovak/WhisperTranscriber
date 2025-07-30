@@ -1,19 +1,20 @@
-# Core app
-streamlit
+# Whisper + CPU-only torch
+--extra-index-url https://download.pytorch.org/whl/cpu
 
-# Whisper + runtime
-openai-whisper
+openai-whisper>=20231117
+torch==2.7.1+cpu
 
-# CPU PyTorch stack (wheels available on PyPI for py3.13)
-torch>=2.6
-torchaudio>=2.6
+# Streamlit app
+streamlit>=1.32
 
-# Audio & features
-librosa>=0.10.2
-soundfile>=0.13.1
-imageio-ffmpeg>=0.4.9
+# Media & audio
+imageio-ffmpeg>=0.4
+librosa==0.10.2.post1
+soundfile>=0.12
 
 # Diarization (clustering)
 scikit-learn>=1.4
-numpy>=1.26
-scipy>=1.11
+
+# Whisper/Librosa dependencies (allow resolver to choose exact versions)
+numpy
+scipy
